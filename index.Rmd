@@ -1,0 +1,1030 @@
+---
+title: "Predicting Popularity of Mashable Articles"
+subtitle: "Utilizing Tree Ensemble Methods"
+author: "Lance Fernando, Rachel Kim, Claire Peng, Ien Whang"
+date: "4/5/2018"
+output: 
+  html_document:
+    toc: true # table of content true
+    number_sections: true  ## if you want number sections at each table header
+    theme: spacelab  # many options for theme, this one is my favorite.
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning=FALSE, message=FALSE)
+```
+
+[Mashable.com](https://mashable.com/) is an online media platform hosting hundreds of postings and shares created every day. In this project, we use features extracted from posts in 2013-2015 to build models in order to predict whether or not a post will be *popular*. The dataset comes from [UCI's Machine Learning Repository](https://archive.ics.uci.edu/ml/datasets/online+news+popularity) containing **58 predictors** (continuous & categorical) and a binary response variable called **popularity**. Our classification models will exclusively focus on tree methods (i.e., decision tree, bagging, random forests, gradient boosting) to fit models using about **32,000** training observations. We will also fit models to a reduced design matrix using *Principal Component Analysis* and compare results. Finally, we will test our models on a held-out test set with about **8,000** observations and assess model accuracy
+
+# Load packages and data
+```{r}
+library(dplyr)
+library(plyr)
+library(ggplot2)
+library(magrittr)
+library(caret) #Upsampling
+library(randomForest) 
+library(rpart)
+library(tree)
+library(pROC)
+library(plotROC)
+library(xgboost) # Gradient boosting
+library(gbm)
+
+mashable <- read.csv("~/Desktop/USFSpring2018/Statistical_Learning/Intro-to-Machine-Learning/Data/OnlineNewsPopularityTraining.csv")
+mashable.test <-read.csv("~/Desktop/USFSpring2018/Statistical_Learning/Intro-to-Machine-Learning/Data/OnlineNewsPopularityTest.csv")
+
+rm_vars <- c("url", "timedelta", "shares")
+mashable <- mashable[, -which(names(mashable) %in% rm_vars)]
+test <-  mashable.test[, -which(names(mashable.test) %in% rm_vars)]
+
+mashable$popular <- factor(mashable$popular)
+test$popular <- factor(test$popular)
+```
+
+
+# Data Exploration
+
+We start with *hypothesis testing* to explore which variables in our dataset are most related to popularity. We will utilize two different types of tests: *difference of means* and *test of independence*. Each test will check the relationship between popularity and a continuous or categorical variable respectively.
+
+## T-tests
+For continuous variables we will use [T-tests](https://en.wikipedia.org/wiki/Student%27s_t-test) to check if there is a significant difference between the averages of a continuous variable (i.e., number of keywords) between a popular and an unpopular post. Our null hypothesis is that the difference in the means is equal to zero. We will analyze the resulting confidence interval amongst the means where significant dependence will result in confidence intervals that lie far away and do not include zero. In order to run these tests, me must first satisfy the assumption that our continuous variable follows a normal distribution. Thus, we log-transform each continuous variable then follow that up with scaling. 
+```{r exploration}
+# Function to log transform data frame of continuous variables
+# with option to scale data
+#
+# args:
+#   df - Data Frame with all continuous columns 
+#   scaled - Whether to center + scale data to have mean = 0 (default=TRUE)
+logTransform <- function(df, scaled = TRUE){
+  df <- na.omit(df) # Omitting any missing values
+  transformed.df <- matrix(data = NA, ncol = ncol(df), nrow = nrow(df))
+  for(i in seq_along(df)){
+    col <- df[,i]
+    
+    # Shifting columns <=0 to have a minimum of 0.001
+    if(min(col) <= 0){
+      shifted_col <- col + (abs(min(col)) + 0.001) 
+      transformed.df[,i] <- log(shifted_col) # Adding to log-transformed dataframe
+    }else{
+      transformed.df[,i] <- log(col)
+    }
+  }
+  transformed.df <- as.data.frame(transformed.df) # converting to data frame
+  names(transformed.df) <- names(df)
+  if(scaled){
+    transformed.df <- scale(transformed.df) %>% as.data.frame()
+    return(transformed.df)
+  }else{
+    return(transformed.df)
+  }
+
+}
+
+# Grabbing categorical columns relating to 'day'
+day_cols <- c("weekday_is_monday", "weekday_is_tuesday", "weekday_is_wednesday", 
+              "weekday_is_thursday", "weekday_is_friday", "is_weekend")
+
+# Grabbing categorical columns relating to 'channel'
+chnl_cols <- grep(pattern = "data_channel",names(mashable), value = TRUE)
+
+# Removing categorical columns
+continuous.df <- mashable[,!names(mashable) %in% c(day_cols,chnl_cols,
+                                                   "popular", "day","channel",
+                                                   "weekday_is_saturday","weekday_is_sunday")]
+conf.df <- data.frame(var = character(0),
+                      lower = numeric(0),
+                      upper = numeric(0),
+                      p_val = numeric(0),
+                      stringsAsFactors = FALSE)
+
+scaled.df <- logTransform(df = continuous.df) # Transforming dataframe
+
+# Running t-test
+for(i in seq_along(scaled.df)){
+  
+  var_name <- names(scaled.df)[i]
+
+  # Two-Sample T.test
+  out <- t.test(x = scaled.df[mashable$popular == 0, i], 
+                y = scaled.df[mashable$popular == 1,i])
+  
+  ci <- as.vector(out$conf.int) # Grabbing confidence interval
+  
+  conf.df[i,] <- data.frame(var = var_name,
+                            lower = ci[1],
+                            upper = ci[2],
+                            p_val = out$p.value, 
+                            stringsAsFactors = FALSE)
+}
+
+# Specifying which are statistically significant
+conf.df$sig <- ifelse(conf.df$p_val <= 0.05, "TRUE", "FALSE")
+# Ordering by significance of p-val for plotting purposes
+conf.df$var <- factor(conf.df$var, levels= conf.df$var[order(conf.df$p_val)])
+
+ggplot(data = conf.df) + 
+  geom_errorbarh(mapping=aes(y = var, xmin = lower,
+                             xmax = upper, x = (upper + lower)/2,
+                             col = sig)) + 
+  geom_vline(mapping=aes(xintercept = 0), linetype=2, color = "purple") + 
+  xlim(c(-0.5, 0.5)) + 
+  theme_light() + 
+  scale_color_discrete(name ="Statistically Significant") + 
+  labs(title = "T-Test CIs Partitioned By Popularity",
+       x = "Scaled Confidence Interval", y = "")
+```
+The confidence intervals that are significant are highlited in **blue**. Any confidence interval that includes zero is deemed insignificant and is highlighted with **red**. According to the plot above, there are a handful of variables whose differences in means based on popularity are significantly different. Variables towards the bottom, whose intervals are farthest away from zero may contain values that rely on the popularity of blogs. For example, the *average shares of the average keyword* (**kw_avg_avg**) has a confidence interval that lies to the far left of zero. This means the difference between *unpopular-avg-kw* & *popular-avg-kw* lies in the negative region. In other words, popularity results in significantly higher average shares of the average keyword than unpopularity.  
+
+
+## Chi-Square Tests of Independence
+For categorical variables we will use [Chi-Square Test of Independence](https://onlinecourses.science.psu.edu/stat500/node/56) to check for independence among popularity and our categorical variables. In this case, our only two categorical variables we have are **Day** and **Channel**. Therefore we are testing whether the popularity of a blog relies on what day it is or what channel the blog is posted on. Our null hypothesis of the Chi-Square test is that popularity and the other variable are independent. Therefore, a significant p-value (i.e., p <= 0.05) will mean that there is a dependence between popularity and the day of the week. For example, if we were to make a table of popularity vs day, the counts in each cell will be equal. First we must merge our dummy variables for the categorical variables so that we can make tables effectively.
+```{r chisq1a}
+day_cols <- c("weekday_is_monday", "weekday_is_tuesday", "weekday_is_wednesday",
+              "weekday_is_thursday", "weekday_is_friday", "weekday_is_saturday", "weekday_is_sunday")
+
+# Creating dataframe with only the day columns
+days <- mashable[,day_cols]
+
+day_col <- rep("None", nrow(mashable)) ## emptied the original data with weekday observations
+for(i in 1:nrow(days)){  ## finding which days of the weeks are popular and not 
+  day_col[i] <- switch(which(unlist(days[i,]) == 1),
+                            `1` = "Monday",
+                            `2` = "Tuesday",
+                            `3` = "Wednesday",
+                            `4` = "Thursday",
+                            `5` = "Friday",
+                            `6` = "Saturday",
+                            `7` = "Sunday")
+}
+
+# Table of popularity by day
+(tbl <- xtabs(~popular+day_col, data = mashable))
+
+# performing statistical test
+(chi.fit <- chisq.test(tbl))
+```
+According to the output above, the day of the week and the popularity of a blog are dependent. However, since there are seven days of the week we do not know which days in particular popularity most depends on. Therefore we perform *post-hoc* pairwise tests. This will look at popularity of each day against the other one at a time. We will then assess the p-value with a [Holm-Bonferonni correction](https://en.wikipedia.org/wiki/Holm%E2%80%93Bonferroni_method) since we're performing multiple comparisons.
+```{r chisq1b}
+# performing post-hoc test 
+post_day <- pairwise.prop.test(x = xtabs(~day_col+popular, data=mashable), p.adjust.method = "holm")
+print(post_day)
+```
+Looking at the matrix above, the only significant p-values are those that compare the *weekend* to any weekday. Therefore we can confirm that *popularity* is dependent on whether or not it is the weekend. Moreover, the day of the weekday (that isn't a weekend) has no effect on popularity. 
+
+Next we perform the same tests on **Channel**.
+```{r chisq2a}
+chnl_cols <- grep(pattern = "data_channel",names(mashable), value = TRUE)
+channels <- mashable[, chnl_cols]
+channel_col <- rep("None", nrow(mashable))
+for(i in 1:nrow(channels)){
+  channel_col[i] <- switch(
+    ifelse(length(which(unlist(channels[i,]) == 1)) == 0, "None", which(unlist(channels[i,]) == 1)),
+    `1` = "Lifestyle",
+    `2` = "Entertainment",
+    `3` = "Business",
+    `4` = "SocMed",
+    `5` = "Tech",
+    `6` = "World",
+    `None` = "None")
+}
+
+(tbl <- xtabs(~channel_col+popular, data=mashable))
+# Significant p-value
+(chi.fit <- chisq.test(tbl))
+
+## performing post-hoc test 
+post_chnl <- pairwise.prop.test(x = tbl, p.adjust.method = "holm")
+post_chnl
+```
+Since our omnibus test proved significant, we then conducted a post-hoc test to assess which channel factor is dependent on popularity. Our results show that popularity differs depending on channel except for **entertainment** and **business**. This means that we could essentially merge the two dummy variables together to create **is_business_or_entertainment** and not lose any information. 
+
+
+## Exploration Summary
+In our exploration, we compared variables to popularity to assess which variable has an individual effect on popularity. Continuous variables with intervals towards the bottom of the chart show significant dependence towards popularity. Moreover, popularity also depends on whether or not it is a weekend and what channel is (merging business and entertainment together). With this, we can evaluate our decision tree to see if any of these variables are used as splitting partitions.
+
+***
+# Preprocessing
+We first up-sample our minority class to have a balanced dataset. We then make sure that our dummy variables are treated as factors instead of numeric values in our model. 
+```{r upSample}
+prop.table(table(mashable$popular))
+# Upsampling to balance the minority class
+train <- upSample(x = mashable[, -ncol(mashable)], y = as.factor(mashable$popular))
+names(train)[ncol(train)] <- "popular"
+
+# Converting response to factor
+pop_idx <- which(names(train) == "popular")
+pop_idx_test <- which(names(test) == "popular")
+
+popular_train <- train[, pop_idx]
+popular_test <- test[, pop_idx_test]
+
+# Converting dummy variables to factors
+factorIndices <- c(12:17, 30:37)
+factorCols <- colnames(train)[factorIndices]
+for(i in factorCols){
+  train[,i] <- as.factor(train[,i])
+  test[,i] <- as.factor(test[,i])
+}
+```
+
+***
+# Modeling
+
+## Single Decision Tree
+```{r tree}
+tree.fit <- tree(popular ~ ., data = train)
+
+summary(tree.fit)
+plot(tree.fit) # visualise tree model
+text(tree.fit)
+```
+Since there are only two terminal nodes in this decision tree, there is no need to prune our model. Notice that the only variable used to split is **kw_avg_avg**. This coincides with our data exploration where we concluded that popularity depends on this variable. 
+
+## Bagging
+We perform [bootstrap aggregation](https://en.wikipedia.org/wiki/Bootstrap_aggregating), or *bagging*, by creating multiple decision trees to gain better predictive accuracy. We grid-search to optimize hyperparameter *nodesize* with *OOB error*. Nodesize controls the number minimum number of observations that must fall in each terminal nodeWe refrain from gridsearching *ntree* since a larger number leads to overfitting. We default with **ntree = 10** which make each model create 5 different trees.
+```{r GSBagging}
+## grid search for BAGGING 
+nodeSizes <- c(1, 5, 25, 100)
+df.bag <- data.frame(nodeSize = numeric(), OOB = numeric())
+for (size in 1:5){
+  fit <- randomForest(as.factor(popular) ~ .,
+                      data = train, mtry = 58,
+                      nodeSize = nodeSizes[size],
+                      importance = TRUE, ntree = 10)
+  df.bag <- rbind(df.bag, data.frame(nodeSize = nodeSizes[size],
+                                     OOB=mean(fit$err.rate[,1])))
+}
+
+```
+
+```{r GSBagload, echo=FALSE}
+# df.bag <- read.csv("~/Desktop/USFSpring2018/Statistical_Learning/MyWork/CaseStudy2/bagging.csv")
+```
+
+```{r GSBag2}
+print(df.bag)
+
+ns.bag <- df.bag$nodeSize[which.min(df.bag$OOB)]
+
+# Optimal node size
+ns.bag
+# Creating model on training set with optimum parameters
+bag.fit <- randomForest(as.factor(popular)~., data=train,
+                        mtry=ncol(train) - 1, nodeSize = ns.bag,
+                        ntree = 10, importance = TRUE)
+varImpPlot(bag.fit)
+```
+The plot above shows variables that are *important* and greatly increase the accuracy of a tree when used as a partition. Notice how there are many variables that we concluded popularity depended on in our exploratory analysis that show up here as highly important variables. 
+
+## Random Forests
+[Random forests](https://en.wikipedia.org/wiki/Random_forest) is a special case of bagging where we randomly sample smaller sets of the predictors for each tree. This reduces the variance of our predictions and decorrelates the trees. With random forests, we grid-search the same hyperparameters as bagging in addition to *mtry* which controls the number of predictors to sample for each tree. In this, we will test for **mtry = c(Sqrt(p), p/2, p/3) where p = number of predictors.
+
+```{r GSRF}
+## grid search for randomForest 
+nodeSizes <- c(1, 5, 25, 100)
+mtrySizes <- c(floor(sqrt(ncol(train))), ncol(train)/2, floor(ncol(train)/3))
+df.rf <- data.frame(mtryUsed = numeric(), nodeSize = numeric(), OOB=numeric())
+for (msize in 1:3){
+  for (size in 1:5){
+    fit <- randomForest(as.factor(popular) ~ ., data = train,
+                        mtry = mtrySizes[msize], 
+                        nodeSize = nodeSizes[size],
+                        importance = TRUE, ntree = 10)
+    df.rf <- rbind(df.rf, data.frame(mtryUsed = mtrySizes[msize],
+                                     nodeSize = nodeSizes[size],
+                                     OOB=mean(fit$err.rate[,1])))
+  }
+}
+```
+
+```{r GSRFload, echo=FALSE}
+# df.rf <- read.csv("~/Desktop/USFSpring2018/Statistical_Learning/MyWork/CaseStudy2/randomforest.csv")
+```
+
+```{r GSRF2}
+print(df.rf)
+
+ns.rf <- df.rf$nodeSize[which.min(df.rf$OOB)]
+mt.rf <- df.rf$mtryUsed[which.min(df.rf$OOB)]
+
+#optimal nodesize
+ns.rf
+#optimal mtry
+mt.rf
+# Creating model on training set with optimum parameters
+rf.fit <- randomForest(as.factor(popular)~., data=train,
+                       mtry=mt.rf, nodeSize = ns.bag,
+                       ntree = 10, importance = TRUE)
+varImpPlot(rf.fit)
+```
+Similarly, important variables in this random forest model mimic variables found in our exploratory analysis. Compared to bagging, there are more variables that have a higher *mean decrease* in random forests. 
+
+## Boosted Trees
+Iterating over a grid of values for the depth of each tree, the number of iterations, and the learning rate to gain a better picture of which values would provide an optimal model that is not overfitted.
+```{r boostLoad, echo=FALSE}
+res <- read.csv("~/Desktop/USFSpring2018/Statistical_Learning/MyWork/CaseStudy2/xgboost.csv")
+```
+
+```{r boost, eval=FALSE}
+install.packages("xgboost")
+library(xgboost)
+
+# run model with cv
+train2.x <- train[,-(which(colnames(train) == "popular"))]
+train2.y <- train2$popular
+test.x <- test[,-(which(colnames(train) == "popular"))]
+test.y <- test$popular
+
+dtrain <- xgb.DMatrix(data = as.matrix(train2.x), label= train2.y)
+dtest <- xgb.DMatrix(data = as.matrix(train2.x), label= train2.y)
+
+res <- data.frame() # data frame for results
+
+depth <- c(2,3,4,5,6)
+iterations <- c(100,200,300,400,500)
+rate <- c(0.001, 0.01, 0.1, 0.3, 0.5)
+
+for (i in 1:length(depth)) {
+  for (j in 1:length(iterations)) {
+    for (k in 1:length(rate)) {
+      boost.mod <- xgboost(data = dtrain, max.depth =depth[i], nround = iterations[j], 
+                           eta = rate[k], objective = "binary:logistic")
+      boost.pred <- predict(boost.mod, dtest)
+      boost.pred.y <- rep(0, length(boost.pred))
+      indices <- which(boost.pred > 0.5) 
+      boost.pred.y[indices] = 1 
+      
+      table <- data.frame(table(boost.pred.y, test$popular))
+      tpr <- (table[4,3])/((table[4,3])+table[3,3]) # sensitivity
+      tnr <- (table[1,3])/((table[1,3])+table[2,3]) # specificity
+      acc <- mean(boost.pred.y == test$popular) #accuracy
+      
+      res.vect <- c(depth[i], iterations[j], rate[k], acc, tpr, tnr)
+      res <- rbind(res, t(res.vect))
+    }
+  }
+}
+
+colnames(res) <- c("Max Depth", "Num Iterations", "Learning Rate", "Accuracy", 
+                   "Sensitivity", "Specificity")
+
+# Grabbing optimal parameters
+sens.idx <- which(res$Sensitivity > 0.75)
+spec.idx <- which(res$Specificity > 0.75)
+lr.idx <- which(res$Learning.Rate < 0.5)
+common.idx <- intersect(sens.idx, spec.idx)
+common.idx <- intersect(common.idx, lr.idx)
+df <- res[c(common.idx),]
+head(df)
+```
+From the output, we came to the conclusion that the model with depth = 3, learning rate = 0.3, and iterations = 400 gave us a model with specificity and sensitivity > 0.75, and an accuracy of 82.4%, when evaluated against the training response. Learning rate was selected at 0.3 to prevent convergence from minimisation from taking place too rapidly, depth was chosen to prevent overfitting on noise, and iterations was kept to a number that was reasonably small.
+
+
+```{r boostCV, eval=FALSE}
+res <- data.frame() # data frame for results
+iterations <- c(400, 420)
+rate <- c(0.25, 0.3, 0.35)
+
+# use maxdepth = 3, learning.rate = 0.3, iterations = 400 as ideal
+for (j in 1:length(iterations)) {
+  for (k in 1:length(rate)) {
+    set.seed(1)
+    boost.cv <- xgb.cv(data = dtrain, nrounds = iterations[j], nfold = 5, metrics = list("rmse"),
+                       max_depth = 3, eta = rate[k], objective = "binary:logistic", verbose = T)
+    mean.test.rmse <- min(boost.cv$evaluation_log$test_rmse_mean)
+    min.idx <- which(boost.cv$evaluation_log$test_rmse_mean == min(boost.cv$evaluation_log$test_rmse_mean))
+    res.vect <- c(iterations[j], rate[k], mean.test.rmse, min.idx) # depth == 3
+    res <- rbind(res, t(res.vect))
+  }
+}
+
+colnames(res) <- c("Num Iterations", "Learning Rate", "Mean Test RMSE", "Corresponding Index")
+```
+
+```{r boostLoad2, echo=FALSE}
+res <- read.csv("~/Desktop/USFSpring2018/Statistical_Learning/MyWork/CaseStudy2/boostingCV.csv")
+```
+
+```{r}
+head(res)
+```
+
+```{r boostfit}
+# Converting factors to numeric as xgb only takes numeric values
+dtrain <- train
+for(i in c(factorIndices, 59)){
+  dtrain[,i] <- as.numeric(as.character(train[,i]))
+}
+
+# Get final boosting cv
+dtrain <- xgb.DMatrix(data = as.matrix(dtrain[,-pop_idx]),
+                      label= dtrain[,pop_idx])
+boost.fit <- xgboost(data = dtrain, nrounds = 420, nfold = 5, metrics = list("rmse","auc"),
+                   max_depth = 3, eta = 0.3, objective = "binary:logistic", verbose = F)
+```
+
+***
+# Fitting Models Using Dimension Reduction (Principal Component Analysis)
+In the previous sections we fit decision trees, bagging trees, random forests, and boosted models using our full set of predictors. Though these algorithms perform greedily in choosing the best variables, they may be subject to the [curse of dimensionality](https://en.wikipedia.org/wiki/Curse_of_dimensionality). Therefore we will be using a smaller set of predictors to fit these models. Our smaller training set will be defined using [Principal Component Analysis](https://en.wikipedia.org/wiki/Principal_component_analysis) and taking the principal components that can cover *85%* of the variance of the data.
+
+## Running PCA
+```{r PCASetup}
+X.matx.trn <- model.matrix(factor(popular) ~ ., data = train)[,-1]
+pr.out <- prcomp(X.matx.trn, retx = TRUE, center = TRUE, scale. = TRUE)
+pr.var <- pr.out$sdev^2
+pve <- pr.var / sum(pr.var)
+
+#visualization 
+par(mfrow = c(1,2))
+plot(pve, xlab = "Principal Component", ylab = "Proportion of Variance Explained", type = "b")
+plot(cumsum(pve), xlab = "Principal Component", ylab = "Cumlative Proportion of Variance Explained", ylim = c(0,1))
+abline(a=0.85, b = 0, col="red")
+# Number of pcs needed to explain 85% of variation
+sum(cumsum(pve) <=0.85)
+
+X.PCtrn <- pr.out$x[,1:25] %>% as.data.frame()
+```
+According to the plot above, we will take the first 25 Principal Components to explain 85% of the variation in the data. This is much better than taking all **58** of the original predictors if we only need 25 PCs to get the job done. Let's check if this works!
+
+## Decision Tree w/ PCA
+When initially fitting in our tree, our we did not get much insight in the cutpoints regions of our trees. Therefore we had to look into the control = tree.control() parameter in order to better fit our upsampled data into our tree. In the tree.control() parameter are the arguments:
+
+
+* mindev - The within-node deviance must be at least this times that of the root node for the node to be split.
+* mincut: The minimum number of observations to include in either child node. This is a weighted quantity; the observational weights are used to compute the ‘number’. The default is 5.
+* minsize: The smallest allowed node size: a weighted quantity. The default is 10.
+```{r treePCA}
+# Grid searching for 'mincut' and 'minsize'
+grid <- expand.grid(mincut = seq(from=5, to = 50, by = 15), minsize =  seq(100, 200, 25))
+
+MSE <- list()
+for(i in 1:nrow(grid)){
+  fit <- tree(popular_train ~ ., data = X.PCtrn, control = tree.control(nrow(X.PCtrn), 
+                                                  mincut = grid[i, 1], minsize = grid[i,2],
+                                                  mindev = 0.001))
+  yhat <- predict(fit, newdata = X.PCtrn, type = "class")
+  MSE[i] <- mean(yhat != popular_train)
+}
+
+grd.srch <- list(mincut = grid[,1], minsize = grid[,2], MSE = unlist(MSE)) %>% data.frame(.)
+head(grd.srch)
+```
+
+After fitting in certain values, we found that fitting in a mindev = 0.001 was the best value to let us enter a grid of mincut and minsize values to find our best tree. Unfortunately, our grid search has failed to be insightful since most tree returned the same MSE and MSPE.
+
+We have decided that setting the mincut = 2 and the minsize = 4 in our tree.control() function is best to fit our biggest tree. The minsize is typically 2x the mincut. Setting our mincut=2 means that for each child node from binary splits, a minimum of two observations from the dataset were considered. This is the smallest argument to create the biggest tree. (Without making a node per observation)
+```{r treePCA2}
+# Fitting a large tre
+pr.tree <- tree(popular_train ~ ., data = X.PCtrn,
+                control = tree.control(nobs = nrow(X.PCtrn),
+                                       mincut = 2, minsize = 4, mindev = 0.001))
+par(mfrow = c(1,1))
+plot(pr.tree)
+text(pr.tree, cex = 0.5)
+```
+
+```{r treePCA3}
+set.seed(123)
+cv.model <- cv.tree(pr.tree, FUN = prune.misclass)
+plot(cv.model)
+
+par(mfrow = c(1, 2))
+plot(cv.model$size, cv.model$dev, type = "b")
+plot(cv.model$k, cv.model$dev, type = "b")
+
+# The models all for the most part result in the same deviance. We'll select 19 for the best tree.
+cv.model
+```
+After cross validating our tree, we have plotted our resulting model's number of terminal nodes (size) and number of misclassifications (deviance). Our plots are not insightful as we found that as the number of terminal nodes increase, the deviance of the model stayed consistent. When plotting our model's k (cost complexity tuning parameter), we also yield similar results. This might be an analgous reaction to how our grid searches for T_0 came out. Both results returned identical values through the different values and this is what is appearing here. This might be from the fact that we are fitting in PCs instead of the actual data, so the cutpoint regions are not too different, but further research on this how our tree and pruning tree reacted can be done.
+We have still computed the minimum deviance for our cross validation tree model and have found that the best tuning parameter to perform weakest link pruning was 19.
+```{r treePCA4}
+# Saving tree object to use later
+tree.pca.fit <- prune.tree(pr.tree, best = 19)
+par(mfrow = c(1,1))
+plot(tree.pca.fit)
+text(tree.pca.fit, cex = 0.5)
+```
+
+***
+## Bagging w/ PCA
+```{r bagPCA}
+nodeSizes <- c(1, 5, 25, 100)
+df.bag.pca <- data.frame(nodeSize = numeric(), OOB=numeric())
+for (msize in 1:3){
+  for (size in 1:5){
+    fit <- randomForest(as.factor(popular_train) ~ ., data = X.PCtrn,
+                        mtry = ncol(X.PCtrn), 
+                        nodeSize = nodeSizes[size],
+                        importance = TRUE, ntree = 10)
+    df.bag.pca <- rbind(df.bag.pca, data.frame( nodeSize = nodeSizes[size],
+                                                OOB=mean(fit$err.rate[,1])))
+  }
+}
+```
+
+
+```{r bagPCA2}
+print(df.bag.pca)
+
+ns.bag <- df.bag.pca$nodeSize[which.min(df.bag.pca$OOB)]
+
+# Optimal node size
+ns.bag
+# Creating model on training set with optimum parameters
+bag.pca.fit <- randomForest(as.factor(popular_train)~., data=X.PCtrn,
+                        mtry=ncol(X.PCtrn), nodeSize = ns.bag,
+                        ntree = 10, importance = TRUE)
+varImpPlot(bag.pca.fit)
+```
+This importance plot shows that **PC3** contributes greatly. It is interesting that we **don't** see importance consecutively by PC# (i.e., PC1 would be most important and PC25 is least). 
+
+## Random Forests w/ PCA
+```{r rfPCA}
+nodeSizes <- c(1, 5, 25, 100)
+mtrySizes <- c(floor(sqrt(ncol(train))), ncol(train)/2, floor(ncol(train)/3))
+df.rf.pca <- data.frame(mtryUsed = numeric(), nodeSize = numeric(), OOB=numeric())
+for (msize in 1:3){
+  for (size in 1:5){
+    fit <- randomForest(as.factor(popular_train) ~ ., data = X.PCtrn,
+                        mtry = mtrySizes[msize], 
+                        nodeSize = nodeSizes[size],
+                        importance = TRUE, ntree = 10)
+    df.rf.pca <- rbind(df.rf.pca, data.frame(mtryUsed = mtrySizes[msize],
+                                     nodeSize = nodeSizes[size],
+                                     OOB=mean(fit$err.rate[,1])))
+  }
+}
+```
+
+
+
+```{r rfPCA2}
+print(df.rf.pca)
+
+ns.rf <- df.rf.pca$nodeSize[which.min(df.rf.pca$OOB)]
+mt.rf <- df.rf.pca$mtryUsed[which.min(df.rf.pca$OOB)]
+
+# Optimal node size
+ns.rf
+# Optimal mtry size
+mt.rf
+# Creating model on training set with optimum parameters
+rf.pca.fit <- randomForest(as.factor(popular_train)~., data=X.PCtrn,
+                        mtry=mt.rf, nodeSize = ns.rf, ntree = 10,
+                        importance = TRUE)
+varImpPlot(rf.pca.fit)
+```
+The *mean accuracy* variables convey importance of variables that follow a linear trend as opposed to a sigmoid type of curve in the other importance plots. 
+
+## Boosted Trees w/ PCA
+Gridsearching for **interaction.depth**, **shrinkage** and **iterations**.
+```{r boostPCA,eval=FALSE}
+set.seed(123)
+depth <- c(2, 3, 4, 5, 6)
+shrink <- c(0.001, 0.01, 0.1, 0.2, 0.5)
+iterations <- c(100,200,300,400,500)
+grid.boot <- expand.grid(depth = depth, shrinkage = shrink, iterations = iterations)
+grid.boot
+df_boot_pca <- data.frame(depth = numeric(), shrink = numeric(), iterations = numeric(), OOB.MSE = numeric())
+
+for(i in 1:nrow(grid.boot)){
+  print(paste(grid.boot[i,]))
+  mod.boot.pca <- gbm(formula = y.train.pop ~., data = X.PCtrn, interaction.depth = grid.boot[i,1], shrinkage = grid.boot[i,2],
+                      n.trees = grid.boot[i,3], distribution = "adaboost", cv.folds = 5)
+  df_boot_pca <- rbind(df_boot_pca, data.frame(depth = grid.boot[i,1],
+                                               shrinkage = grid.boot[i,2], iterations = grid.boot[i,3],
+                                               OOB.MSE = mean(mod.boot.pca$oobag.improve)))
+}
+
+```
+```{r boostPCALoad, echo=FALSE}
+df_boot_pca <- read.csv("~/Desktop/USFSpring2018/Statistical_Learning/MyWork/CaseStudy2/boostPCA.csv")
+```
+
+```{r boostPCA2}
+head(df_boot_pca)
+# Fitting final model
+boost.pca.fit <- gbm(popular_train~., data=X.PCtrn,
+                     distribution = "adaboost", n.trees = 500,
+                     shrinkage = 0.001, interaction.depth = 4)
+```
+***
+# Model Assessment
+First we will fit each model on their respective training set (i.e., reduced and unreduced via PCA) with the hyperparameters that were optimized in the previous sections. We then assess their respective ROC curves to find an optimal classification threshold. Next, we compute predictions for each model using the test set. 
+
+## ROC Analysis For Threshold
+Fitting the models on the training set to find optimal classification thresholds.
+```{r roc}
+tree.yhat <- predict(tree.fit, newdata=train, type="vector")[,2]
+roc.tree <- roc(popular_train, tree.yhat)
+thresh.tree <- coords(roc=roc.tree, x="best")
+cat(names(thresh.tree), "\n",
+    thresh.tree,"\n\n",
+    "Area under the curve: " ,roc.tree$auc)
+
+# Tree w/ PCA
+tree.pca.yhat <- predict(tree.pca.fit, newdata = X.PCtrn, type="vector")[,2]
+roc.tree.pca<- roc(popular_train, tree.pca.yhat)
+thresh.tree.pca <- coords(roc=roc.tree.pca, x="best")
+cat(names(thresh.tree.pca), "\n",
+    thresh.tree.pca,"\n\n",
+    "Area under the curve: " ,roc.tree.pca$auc)
+
+# Bagging 
+bag.yhat <- predict(bag.fit, newdata = train, type="prob")[,2]
+roc.bag <- roc(popular_train, bag.yhat)
+thresh.bag <- coords(roc=roc.bag, x="best")
+cat(names(thresh.bag), "\n",
+    thresh.bag,"\n\n",
+    "Area under the curve: " ,roc.bag$auc)
+
+# Bagging w/ PCA
+bag.pca.yhat <- predict(bag.pca.fit, newdata = X.PCtrn, type = "prob")[,2]
+roc.bag.pca<- roc(popular_train, bag.pca.yhat)
+thresh.bag.pca <- coords(roc=roc.bag.pca, x="best")
+cat(names(thresh.bag.pca), "\n",
+    thresh.bag.pca,"\n\n",
+    "Area under the curve: " ,roc.bag.pca$auc)
+
+# Random Forest 
+rf.yhat <- predict(rf.fit, newdata = train, type = "prob")[,2]
+roc.rf <- roc(popular_train, rf.yhat)
+thresh.rf <- coords(roc=roc.rf, x="best")
+cat(names(thresh.rf), "\n",
+    thresh.rf,"\n\n",
+    "Area under the curve: " ,roc.rf$auc)
+
+# Random Forest w/ PCA
+rf.pca.yhat <- predict(rf.pca.fit, newdata = X.PCtrn, type = "prob")[,2]
+roc.rf.pca <- roc(popular_train, rf.pca.yhat)
+thresh.rf.pca <- coords(roc=roc.rf.pca, x="best")
+cat(names(thresh.rf.pca), "\n",
+    thresh.rf.pca,"\n\n",
+    "Area under the curve: " ,roc.rf.pca$auc)
+
+
+boost.yhat <- predict(boost.fit, newdata = dtrain)
+roc.boost <- roc(popular_train, boost.yhat)
+thresh.boost <- coords(roc=roc.boost, x="best")
+cat(rep(rownames(thresh.boost),2), "\n",
+    thresh.boost,"\n\n",
+    "Area under the curve: " ,roc.boost$auc)
+
+boost.pca.yhat <- predict(boost.pca.fit, newdata = X.PCtrn, n.trees = 500,
+                          type = "response")
+roc.boost.pca <- roc(popular_train, boost.pca.yhat)
+thresh.boost.pca <- coords(roc=roc.boost.pca, x="best")
+cat(names(thresh.boost.pca), "\n",
+    thresh.boost.pca,"\n\n",
+    "Area under the curve: " ,roc.boost.pca$auc)
+```
+
+```{r rocPlots, echo=FALSE}
+# Creating plots 
+# Models without PCA
+no.pca <- rbind(data.frame(model=rep("Tree", length(popular_train)),
+                         d = popular_train, m = tree.yhat),
+                    data.frame(model=rep("Bagging", length(popular_train)),
+                         d = popular_train, m = bag.yhat),
+                    data.frame(model=rep("Random Forest", length(popular_train)),
+                         d = popular_train, m = rf.yhat),
+                    data.frame(model=rep("Boosting", length(popular_train)),
+                         d = popular_train, m = boost.yhat))
+ggplot(data=no.pca, mapping=aes(d = as.numeric(as.character(d)), 
+                             m = m,
+                             col = model)) + 
+         geom_roc() + 
+         ggtitle("Tree Methods ROC")
+
+yes.pca <- rbind(data.frame(model=rep("Tree", length(popular_train)),
+                         d = popular_train, m = tree.pca.yhat),
+                    data.frame(model=rep("Bagging", length(popular_train)),
+                         d = popular_train, m = bag.pca.yhat),
+                    data.frame(model=rep("Random Forest", length(popular_train)),
+                         d = popular_train, m = rf.pca.yhat),
+                    data.frame(model=rep("Boosting", length(popular_train)),
+                         d = popular_train, m = boost.pca.yhat))
+# Models with PCA
+ggplot(data=yes.pca, mapping=aes(d = as.numeric(as.character(d)), 
+                             m = m,
+                             col = model)) + 
+         geom_roc() + 
+         ggtitle("Tree Methods w/ PCA ROC")
+
+all <- rbind(data.frame(model=rep("Tree", length(popular_train)),
+                         d = popular_train, m = tree.yhat),
+                    data.frame(model=rep("Bagging", length(popular_train)),
+                         d = popular_train, m = bag.yhat),
+                    data.frame(model=rep("Random Forest", length(popular_train)),
+                         d = popular_train, m = rf.yhat),
+                    data.frame(model=rep("Boosting", length(popular_train)),
+                         d = popular_train, m = boost.yhat),
+                    data.frame(model=rep("Tree w/PCA", length(popular_train)),
+                         d = popular_train, m = tree.pca.yhat),
+                    data.frame(model=rep("Bagging w/PCA", length(popular_train)),
+                         d = popular_train, m = bag.pca.yhat),
+                    data.frame(model=rep("Random Forest w/PCA", length(popular_train)),
+                         d = popular_train, m = rf.pca.yhat),
+                    data.frame(model=rep("Boosting w/PCA", length(popular_train)),
+                         d = popular_train, m = boost.pca.yhat))
+# All models
+ggplot(data=all, mapping=aes(d = as.numeric(as.character(d)), 
+                             m = m,
+                             col = model)) + 
+         geom_roc() + 
+         ggtitle("All Models ROC")
+
+```
+The AUC for random forests and bagging with and without PCA are all 1. This means that our models are perfectly classifying 1s and 0s on our training set even with using a small amount of trees (i.e., ntree=5). Trees have underfitting curves that fall closer to the 0.5 (random) line. Boosting without PCA lies nicely in the middle, not overfitting like the other complex tree algorithms. Boosting with PCA performs slightly worse than single trees. Lets see how they do on our test set.
+
+## Test Set Preprocess
+```{r testPCA}
+# Creating reduced test set
+X.matx.tst <- model.matrix(factor(popular) ~ ., data = test)[, -1]
+X.PCtst <- scale(X.matx.tst, scale = TRUE, center = TRUE) %*% pr.out$rotation[,1:25] %>%
+  as.data.frame()
+
+# Creating test for boosting
+dtest <- test
+for(i in c(factorIndices, 59)){
+  dtest[,i] <- as.numeric(as.character(test[,i]))
+}
+dtest <- xgb.DMatrix(data = as.matrix(dtest[,-pop_idx]),
+                      label= dtest[,pop_idx])
+
+```
+
+## Make Test Predictions With Optimal Thresholds
+Now that we have optimal thresholds for each model, we will make predictions.
+
+```{r predictions}
+thresh.tree[1]
+thresh.tree.pca[1]
+thresh.bag[1]
+thresh.bag.pca[1]
+thresh.rf[1]
+thresh.rf.pca[1]
+thresh.boost[1]
+thresh.boost.pca[1]
+
+# Tree
+# Vector or predictions
+tree.pred <- ifelse(predict(tree.fit, newdata = test,
+                            type="vector")[,2] >= thresh.tree[1], 1, 0)
+# Vector of probabilities
+tree.prob <- predict(tree.fit, newdata = test, type="vector")[,2]
+# AUC for model
+tree.auc <- roc(popular_test, tree.prob)$auc[1]
+
+# Tree w/PCA
+tree.pca.pred <- ifelse(predict(tree.pca.fit, newdata = X.PCtst,
+                                type="vector")[,2] >= thresh.tree.pca[1], 1, 0)
+tree.pca.prob <- predict(tree.pca.fit, newdata = X.PCtst,
+                                type="vector")[,2]
+tree.pca.auc <- roc(popular_test, tree.pca.prob)$auc[1]
+
+# Bag
+bag.pred <- ifelse(predict(bag.fit, newdata = test,
+                           type="prob")[,2] >= thresh.bag[1], 1, 0)
+bag.prob <- predict(bag.fit, newdata = test,
+                           type="prob")[,2]
+bag.auc <- roc(popular_test, bag.prob)$auc[1]
+
+
+# Bag w/PCA
+bag.pca.pred <- ifelse(predict(bag.pca.fit, newdata = X.PCtst,
+                           type="prob")[,2] >= thresh.bag.pca[1], 1, 0)
+bag.pca.prob <- predict(bag.pca.fit, newdata = X.PCtst,
+                           type="prob")[,2]
+bag.pca.auc <- roc(popular_test, bag.pca.prob)$auc[1]
+
+
+# rf 
+rf.pred <- ifelse(predict(rf.fit, newdata = test,
+                           type="prob")[,2] >= thresh.rf[1], 1, 0)
+rf.prob <- predict(rf.fit, newdata = test,
+                           type="prob")[,2]
+rf.auc <- roc(popular_test, rf.prob)$auc[1]
+
+
+# rf w/PCA
+rf.pca.pred <- ifelse(predict(rf.pca.fit, newdata = X.PCtst,
+                           type="prob")[,2] >= thresh.rf.pca[1], 1, 0)
+rf.pca.prob <- predict(rf.pca.fit, newdata = X.PCtst,
+                           type="prob")[,2]
+rf.pca.auc <- roc(popular_test, rf.pca.prob)$auc[1]
+
+# boost
+boost.pred <- ifelse(predict(boost.fit, newdata = dtest) >= thresh.boost[1], 1, 0)
+boost.prob <- predict(boost.fit, newdata = dtest)
+boost.auc <- roc(popular_test, boost.prob)$auc[1]
+
+# boost w/PCA
+boost.pca.pred <- ifelse(predict(boost.pca.fit, newdata = X.PCtst,
+                           type="response", n.trees = 500) >= thresh.boost.pca[1], 1, 0)
+boost.pca.prob <- predict(boost.pca.fit, newdata = X.PCtst,
+                           type="response", n.trees = 500)
+boost.pca.auc <- roc(popular_test, boost.pca.prob)$auc[1]
+
+```
+
+```{r rocPlotsTest, echo=FALSE}
+# Creating plots 
+# Models without PCA
+no.pca <- rbind(data.frame(model=rep("Tree", length(popular_test)),
+                         d = popular_test, m = tree.prob),
+                    data.frame(model=rep("Bagging", length(popular_test)),
+                         d = popular_test, m = bag.prob),
+                    data.frame(model=rep("Random Forest", length(popular_test)),
+                         d = popular_test, m = rf.prob),
+                    data.frame(model=rep("Boosting", length(popular_test)),
+                         d = popular_test, m = boost.prob))
+ggplot(data=no.pca, mapping=aes(d = as.numeric(as.character(d)), 
+                             m = m,
+                             col = model)) + 
+         geom_roc() + 
+         ggtitle("Tree Methods ROC")
+
+yes.pca <- rbind(data.frame(model=rep("Tree", length(popular_test)),
+                         d = popular_test, m = tree.pca.prob),
+                    data.frame(model=rep("Bagging", length(popular_test)),
+                         d = popular_test, m = bag.pca.prob),
+                    data.frame(model=rep("Random Forest", length(popular_test)),
+                         d = popular_test, m = rf.pca.prob),
+                    data.frame(model=rep("Boosting", length(popular_test)),
+                         d = popular_test, m = boost.pca.prob))
+# Models with PCA
+ggplot(data=yes.pca, mapping=aes(d = as.numeric(as.character(d)), 
+                             m = m,
+                             col = model)) + 
+         geom_roc() + 
+         ggtitle("Tree Methods w/ PCA ROC")
+
+all <- rbind(data.frame(model=rep("Tree", length(popular_test)),
+                         d = popular_test, m = tree.prob),
+                    data.frame(model=rep("Bagging", length(popular_test)),
+                         d = popular_test, m = bag.prob),
+                    data.frame(model=rep("Random Forest", length(popular_test)),
+                         d = popular_test, m = rf.prob),
+                    data.frame(model=rep("Boosting", length(popular_test)),
+                         d = popular_test, m = boost.prob),
+                    data.frame(model=rep("Tree w/PCA", length(popular_test)),
+                         d = popular_test, m = tree.pca.prob),
+                    data.frame(model=rep("Bagging w/PCA", length(popular_test)),
+                         d = popular_test, m = bag.pca.prob),
+                    data.frame(model=rep("Random Forest w/PCA", length(popular_test)),
+                         d = popular_test, m = rf.pca.prob),
+                    data.frame(model=rep("Boosting w/PCA", length(popular_test)),
+                         d = popular_test, m = boost.pca.prob))
+# All models
+ggplot(data=all, mapping=aes(d = as.numeric(as.character(d)), 
+                             m = m,
+                             col = model)) + 
+         geom_roc() + 
+         ggtitle("All Models ROC")
+```
+In terms of ROC and AUC, a **single tree** with and without PCA does better than random forests and bagging on the test set.
+
+
+## Specificity and Sensitivity
+If we were to only look at MSPE to rank our models, we would have very misleading metrics given that our labels are highly unbalanced. For example, if we had labels that were 80%-0s and 20%-1s and a model that only predicted 0s, our MSPE would give us a wopping 20% misclassification error rate! Thus we also have to assess the *specificity* (TNR) and the *sensitivity* (TPR) of our models. This will give us a fair measurement of how well our models are actually classifying the data. 
+```{r PerformanceAssessment}
+
+# Creating functions to compute sensitivity and specificity
+getSensitivity <- function(mtrx){
+  #If all predictions are 0
+  if(nrow(mtrx) == 1){
+    return(0)
+  }else{
+    return(mtrx[2,2] / (mtrx[2,2] + mtrx[1,2]))
+  }
+}
+getSpecificity <- function(mtrx){
+  if(nrow(mtrx) == 1){
+    return(1)
+  }
+  return(mtrx[1,1] / (mtrx[1,1] + mtrx[2,1]))
+}
+
+# Runs full analysis of classification on a test set
+# Assesses the specificity and sensitivity and plots
+# models on an ROC space
+# 
+# args: 
+#     ytest - vector of test labels
+#     yhats - list of predictions, one vector for each model
+#     model_names - vector of strings for the model names
+#
+# returns:
+#     list() with the following objects
+#       model.metrics - dataframe with the models and their respective metrics
+#       p1 - plot of the mspes
+#       p2 - plot of the sensitivity and specificity
+#       p3 - plot of models on the ROC space
+assessPerformance <- function(ytest, yhats, model_names){
+  specificities <- rep(NA, length(yhats))
+  sensitivities <- rep(NA, length(yhats))
+  mspes <- rep(NA, length(yhats))
+  for(i in seq_along(yhats)){
+    mtrx <- table(ytest, yhats[[i]])
+    specificities[i] <- getSpecificity(mtrx)
+    sensitivities[i] <- getSensitivity(mtrx)
+    mspes[i] <- sum(ytest != yhats[[i]])/ length(ytest)
+  }
+  
+  models <- rep(model_names, 3)
+  metrics <- c(rep("MSPE", length(model_names)),
+               rep("Specificity", length(model_names)),
+               rep("Sensitivity", length(model_names)))
+  
+  vals <- c(mspes, specificities, sensitivities)
+  
+  model.metrics <- data.frame(model = models,
+                              metrics = metrics,
+                              value = vals)
+  
+  p1 <- ggplot(data=model.metrics[model.metrics$metrics == "MSPE",]) + 
+  geom_bar(mapping=aes(x=model, 
+                       y=value,
+                       fill=model), stat="identity", show.legend = FALSE) +  
+  labs(x="", y="", title="Test MSPE of Each Model") + theme(axis.text.x = element_text(angle = 45, hjust = 1),
+                                                            plot.title = element_text(hjust = 0.5))
+  
+  p2 <- ggplot(data=model.metrics[model.metrics$metrics %in% c("Specificity", "Sensitivity"),]) + 
+      geom_bar(mapping=aes(x=model,
+                           y=value,
+                           fill=metrics), stat="identity", position="dodge") + 
+      labs(x="", y="", title="Analysis of Sensitivity and Specificity") + 
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          plot.title = element_text(hjust = 0.5))
+  
+  TPR <- specificities
+  FPR <- 1-sensitivities
+
+  p3 <- ggplot() + 
+    geom_point(mapping=aes(x = FPR, y = TPR)) + 
+    geom_label(mapping=aes(x = FPR, y = TPR, label=model_names)) + 
+    geom_abline(mapping=aes(slope = 1, intercept = 0), linetype=2, col="red") + 
+    labs(title="ROC Space Assessment") + 
+    ylim(0,1) + xlim(0,1)
+  return(list(model.metrics,
+              p1,p2,p3))
+}
+
+performance <- assessPerformance(ytest = popular_test,
+                                 yhats = list(tree.pred, tree.pca.pred,
+                                              bag.pred,bag.pca.pred,
+                                              rf.pred,rf.pca.pred,
+                                              boost.pred),
+                                 model_names = c("Tree", "Tree w/PCA",
+                                                 "Bagging", "Bagging w/PCA",
+                                                 "Random Forest", "Random Forest w/PCA",
+                                                 "Boosting"))
+performance[[2]]
+performance[[3]]
+performance[[4]]
+
+ggplot() + geom_bar(mapping=aes(x = c("Tree", "Tree w/PCA",
+                                      "Bagging", "Bagging w/PCA",
+                                      "Random Forest", "Random Forest w/PCA",
+                                      "Boosting"),
+                                y = c(tree.auc, tree.pca.auc,
+                                      bag.auc, bag.pca.auc,
+                                      rf.auc, rf.pca.auc,
+                                      boost.auc),
+                                fill = c("Tree", "Tree w/PCA",
+                                      "Bagging", "Bagging w/PCA",
+                                      "Random Forest", "Random Forest w/PCA",
+                                      "Boosting")),
+                    stat = "identity",
+                    show.legend = FALSE) + 
+  labs(title="AUC For All Models", x = "", y = "AUC") + 
+  scale_fill_discrete(name = "Model") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+      plot.title = element_text(hjust = 0.5))
+
+```
+
+
+***
+# Summary & Results
+
+In this project, we used a set of 58 predictors extracted from 30,000 posts on *Mashable.com* to determine whether that post will be popular. We started by running statistical hypothesis tests to determine which variables popularity most depended on. We then fit our data using various tree methods such as a single tree, bagging, random forest and boosting. Next, we took a different approach and fit those same models to Principal Components. We analyzed the variables that these models deemed important and noticed that our exploratory analysis followed the intuition of these models. By using an ROC curve, we uniquely optimized the classification threshold that would give the highest specificity and sensitivity. We then used these models to predict on our test set.
+
+By assessing **MSPE**, **ROC curves**, **AUC**, **Sensitivity** and **Specificity** we choose *random forests* with the following hyperparameters : 
+
+* mtry = sqrt(p)
+* nodeSize = 25
+* ntree = 5
+
+and the following metrics:
+
+* MSPE = 0.2132947
+* AUC = 0.7044963
+* Sensitivity = 0.4447005
+* Specificity = 0.8065119
+
+
+
+
